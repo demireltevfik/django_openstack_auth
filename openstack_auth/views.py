@@ -17,6 +17,7 @@ from django.contrib import auth
 from django.contrib.auth.decorators import login_required  # noqa
 from django.contrib.auth import views as django_auth_views
 from django.contrib import messages
+from django.core.mail import EmailMessage
 from django import http as django_http
 from django import shortcuts
 from django.utils import functional
@@ -27,6 +28,7 @@ from django.views.decorators.csrf import csrf_exempt  # noqa
 from django.views.decorators.csrf import csrf_protect  # noqa
 from django.views.decorators.debug import sensitive_post_parameters  # noqa
 from keystoneauth1 import exceptions as keystone_exceptions
+from keystoneauth1 import token_endpoint
 import six
 
 from openstack_auth import exceptions
@@ -37,6 +39,14 @@ from openstack_auth import forms
 from openstack_auth.forms import Login  # noqa
 from openstack_auth import user as auth_user
 from openstack_auth import utils
+
+from itsdangerous import URLSafeTimedSerializer
+from openstack_user_management.connectors.openstack_connector \
+    import OpenstackConnector
+
+import random
+import string
+
 
 try:
     is_safe_url = http.is_safe_url
@@ -56,6 +66,7 @@ def login(request, template_name=None, extra_context=None, **kwargs):
     # If the user enabled websso and selects default protocol
     # from the dropdown, We need to redirect user to the websso url
     if request.method == 'POST':
+
         auth_type = request.POST.get('auth_type', 'credentials')
         if utils.is_websso_enabled() and auth_type != 'credentials':
             auth_url = request.POST.get('region')
@@ -114,11 +125,280 @@ def login(request, template_name=None, extra_context=None, **kwargs):
         auth_user.set_session_from_user(request, request.user)
         regions = dict(forms.Login.get_region_choices())
         region = request.user.endpoint
-        login_region = request.POST.get('region')
-        region_name = regions.get(login_region)
+        region_name = regions.get(region)
         request.session['region_endpoint'] = region
         request.session['region_name'] = region_name
     return res
+
+
+@sensitive_post_parameters()
+@csrf_exempt
+@never_cache
+def register(request):
+    form = forms.Register()
+
+    if request.method == 'POST':
+
+        registered = ''
+        form = forms.Register(request.POST)
+        if form.is_valid():
+
+            registered = 'OK'
+            univ = request.POST.get('university')
+            email = request.POST.get('email')
+            username = email
+            projectname = username
+            projectdescription = projectname + '\'s Project on OpenStack'
+            password = request.POST.get('password')
+            repassword = request.POST.get('retype_password')
+
+            try:
+                client_address = request.META['HTTP_X_FORWARDED_FOR']
+            except Exception:
+                client_address = request.META['REMOTE_ADDR']
+
+            LOG.info("Client IP: " + client_address)
+
+            if not (projectname and univ and password and repassword):
+                registered = 'empty_fields'
+                return shortcuts.render(
+                    request, 'auth/register.html',
+                    {'registered': registered, 'form': form})
+
+            if not (password == repassword):
+                registered = 'passwords_not_match'
+                return shortcuts.render(
+                    request, 'auth/register.html',
+                    {'registered': registered, 'form': form})
+
+            if not (len(password) >= 6):
+                registered = 'passwords_too_weak'
+                return shortcuts.render(
+                    request, 'auth/register.html',
+                    {'registered': registered, 'form': form})
+
+            if univ not in email:
+                registered = 'univ_mail_not_used'
+                return shortcuts.render(
+                    request, 'auth/register.html',
+                    {'registered': registered, 'form': form})
+
+            # TODO(ecelik): also save and log user ip
+
+            conn = OpenstackConnector()
+            if not conn.check_username_availability(username):
+                registered = 'user_in_use'
+                return shortcuts.render(
+                    request, 'auth/register.html',
+                    {'registered': registered, 'form': form})
+
+            # TODO(ecelik): Get domain name
+            if not conn.create_project(
+                    "default", projectdescription, projectname,
+                    client_address, univ):
+                registered = 'openstack_error'
+                return shortcuts.render(
+                    request, 'auth/register.html',
+                    {'registered': registered, 'form': form})
+
+            if not conn.create_user("default", email, username, password):
+                registered = 'openstack_error'
+                return shortcuts.render(
+                    request, 'auth/register.html',
+                    {'registered': registered, 'form': form})
+
+            default_role_name = settings.OPENSTACK_KEYSTONE_DEFAULT_ROLE
+
+            if default_role_name is None:
+                registered = 'openstack_error'
+                return shortcuts.render(
+                    request, 'auth/register.html',
+                    {'registered': registered, 'form': form})
+
+            if not conn.pair_user_with_project(username, projectname,
+                                               default_role_name):
+                registered = 'openstack_error'
+                return shortcuts.render(
+                    request, 'auth/register.html',
+                    {'registered': registered, 'form': form})
+
+            if not conn.init_network(projectname,
+                                     settings.OPENSTACK_EXT_NET,
+                                     settings.OPENSTACK_DNS_NAMESERVERS,
+                                     settings.OPENSTACK_DEFAULT_SUBNET_CIDR,
+                                     settings.OPENSTACK_DEFAULT_GATEWAY_IP):
+                LOG.warning('Network could not be initialized for project ' +
+                            projectname + '.')
+
+            send_confirmation_mail(username, email)
+    else:
+        registered = ''
+    return shortcuts.render(
+        request, 'auth/register.html',
+        {'registered': registered, 'form': form})
+
+
+def generate_confirmation_token(secret):
+    serializer = URLSafeTimedSerializer(settings.SECRET_KEY)
+    return serializer.dumps(secret, salt=settings.SECURITY_PASSWORD_SALT)
+
+
+def confirm_token(token, expiration=3600):
+    serializer = URLSafeTimedSerializer(settings.SECRET_KEY)
+    try:
+        secret = serializer.loads(
+            token,
+            salt=settings.SECURITY_PASSWORD_SALT,
+            max_age=expiration
+        )
+    except Exception:
+        return False
+    return secret
+
+
+def confirm_mail(request, token):
+    username = confirm_token(token)
+    projectname = username
+    if username is False:
+        return shortcuts.render(
+            request, 'auth/activation.html',
+            {'page_title': 'Activation', 'activation': 'FAIL'})
+    else:
+        # enable user
+        activation = 'OK'
+        conn = OpenstackConnector()
+        if not conn.update_project_status(projectname, True):
+            activation = 'openstack_error'
+        if not conn.update_user_status(username, True):
+            activation = 'openstack_error'
+
+        # TODO(ecelik): send_success_mail(username, email)
+        return shortcuts.render(
+            request, 'auth/activation.html',
+            {'page_title': 'Activation', 'activation': activation})
+
+
+def forgot_password(request, email):
+
+    username = email
+
+    conn = OpenstackConnector()
+    if conn.check_username_availability(username):
+        LOG.warning("User not exist in OpenStack: Username: " + username)
+        return shortcuts.render(
+            request, 'auth/activation.html',
+            {'page_title': 'Forgot Password', 'activation': 'FAIL'})
+
+    LOG.info("Resetting password of " + email)
+
+    s = string.lowercase + string.digits
+    randpassword = ''.join(random.sample(s, 10))
+
+    if not conn.update_user_password(username, randpassword):
+        return shortcuts.render(
+            request, 'auth/activation.html',
+            {'page_title': 'Forgot Password', 'activation': 'FAIL'})
+
+    send_reset_password_mail(username, email, randpassword)
+
+    return django_http.HttpResponseRedirect(settings.LOGIN_URL)
+
+
+def resend_confirm_mail(request, email):
+
+    username = email
+
+    conn = OpenstackConnector()
+    if conn.check_username_availability(username):
+        LOG.warning("User not exist in OpenStack: Username: " + username)
+        return shortcuts.render(
+            request, 'auth/activation.html',
+            {'page_title': 'Activation', 'activation': 'FAIL'})
+
+    LOG.info("Sending confirmation e-mail to " + email)
+
+    send_confirmation_mail(username, email)
+    return django_http.HttpResponseRedirect(settings.LOGIN_URL)
+
+
+def send_confirmation_mail(username, email):
+
+    confirmation_token = generate_confirmation_token(username)
+    confirm_url = settings.DOMAIN_URL + "auth/confirm_mail/"
+    confirm_url = confirm_url + confirmation_token
+
+    # TODO(ecelik): Use a template for confirmation mail
+    subject = "B3LAB OpenStack Registration Confirmation Mail"
+    from_email = settings.EMAIL_HOST_USER
+    to_list = [email, settings.EMAIL_HOST_USER]
+
+    html_content = '<html>\
+            <body>\
+                <p>Welcome to B3LAB OpenStack!</p>\
+                <br> <br>\
+                Your OpenStack username is ' + username + '\
+                <br> <br>\
+                To finish setting up your OpenStack account, please verify '\
+                'your e-mail address by clicking the following link.\
+                <br>\
+                <a href="' + confirm_url + '">' + confirm_url + '</a>\
+                <br> <br>\
+                If you did not make this request please ignore this message.\
+                <br> <br>\
+                Sincerely,\
+                <br>\
+                B3LAB team\
+                <br>\
+                <br>\
+            </body>\
+            </html>'
+
+    msg = EmailMessage(subject, html_content, from_email, to_list)
+    msg.content_subtype = "html"
+    res = msg.send()
+
+    if str(res) == "1":
+        LOG.info("Confirmation email sent successfully.")
+    else:
+        LOG.error("Confirmation email not sent. " + res)
+    return
+
+
+def send_reset_password_mail(username, email, password):
+    subject = "B3LAB OpenStack Reset Password"
+    from_email = settings.EMAIL_HOST_USER
+    to_list = [email, settings.EMAIL_HOST_USER]
+
+    # TODO(ecelik): Use a template for reset password mail
+    html_content = '<html>\
+            <body>\
+                <p>Welcome to B3LAB OpenStack!</p>\
+                <br> <br>\
+                Your OpenStack username is ' + username + '\
+                <br> <br>\
+                Your password has been reset.\
+                <br>\
+                New Password: ' + password + '\
+                <br> <br>\
+                You can later change this password from Settings menu.\
+                <br> <br>\
+                Sincerely,\
+                <br>\
+                B3LAB team\
+                <br>\
+                <br>\
+            </body>\
+            </html>'
+
+    msg = EmailMessage(subject, html_content, from_email, to_list)
+    msg.content_subtype = "html"
+    res = msg.send()
+
+    if str(res) == "1":
+        LOG.info("Reset password email sent successfully.")
+    else:
+        LOG.error("Reset password email not sent. " + res)
+    return
 
 
 @sensitive_post_parameters()
@@ -158,6 +438,17 @@ def logout(request, login_url=None, **kwargs):
     msg = 'Logging out user "%(username)s".' % \
         {'username': request.user.username}
     LOG.info(msg)
+    endpoint = request.session.get('region_endpoint')
+
+    # delete the project scoped token
+    token = request.session.get('token')
+    if token and endpoint:
+        delete_token(endpoint=endpoint, token_id=token.id)
+
+    # delete the domain scoped token if set
+    domain_token = request.session.get('domain_token')
+    if domain_token and endpoint:
+        delete_token(endpoint=endpoint, token_id=domain_token.auth_token)
 
     """ Securely logs a user out. """
     return django_auth_views.logout_then_login(request, login_url=login_url,
@@ -166,7 +457,22 @@ def logout(request, login_url=None, **kwargs):
 
 def delete_token(endpoint, token_id):
     """Delete a token."""
-    LOG.warn("The delete_token method is deprecated and now does nothing")
+    try:
+        endpoint = utils.fix_auth_url_version(endpoint)
+
+        session = utils.get_session()
+        auth_plugin = token_endpoint.Token(endpoint=endpoint,
+                                           token=token_id)
+        client = utils.get_keystone_client().Client(session=session,
+                                                    auth=auth_plugin)
+        if utils.get_keystone_version() >= 3:
+            client.tokens.revoke_token(token=token_id)
+        else:
+            client.tokens.delete(token=token_id)
+
+        LOG.info('Deleted token %s' % token_id)
+    except keystone_exceptions.ClientException:
+        LOG.info('Could not delete token')
 
 
 @login_required
@@ -175,7 +481,7 @@ def switch(request, tenant_id, redirect_field_name=auth.REDIRECT_FIELD_NAME):
     LOG.debug('Switching to tenant %s for user "%s".'
               % (tenant_id, request.user.username))
 
-    endpoint, __ = utils.fix_auth_url_version_prefix(request.user.endpoint)
+    endpoint = utils.fix_auth_url_version(request.user.endpoint)
     session = utils.get_session()
     # Keystone can be configured to prevent exchanging a scoped token for
     # another token. Always use the unscoped token for requesting a
@@ -205,6 +511,10 @@ def switch(request, tenant_id, redirect_field_name=auth.REDIRECT_FIELD_NAME):
         redirect_to = settings.LOGIN_REDIRECT_URL
 
     if auth_ref:
+        old_endpoint = request.session.get('region_endpoint')
+        old_token = request.session.get('token')
+        if old_token and old_endpoint and old_token.id != auth_ref.auth_token:
+            delete_token(endpoint=old_endpoint, token_id=old_token.id)
         user = auth_user.create_user_from_token(
             request,
             auth_user.Token(auth_ref, unscoped_token=unscoped_token),

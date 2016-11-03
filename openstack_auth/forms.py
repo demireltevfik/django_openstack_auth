@@ -22,6 +22,7 @@ from django.utils.translation import ugettext_lazy as _
 from django.views.decorators.debug import sensitive_variables  # noqa
 
 from openstack_auth import exceptions
+from openstack_auth import univs
 from openstack_auth import utils
 
 
@@ -57,6 +58,7 @@ class Login(django_auth_forms.AuthenticationForm):
     def __init__(self, *args, **kwargs):
         super(Login, self).__init__(*args, **kwargs)
         fields_ordering = ['username', 'password', 'region']
+
         if getattr(settings,
                    'OPENSTACK_KEYSTONE_MULTIDOMAIN_SUPPORT',
                    False):
@@ -134,4 +136,27 @@ class Login(django_auth_forms.AuthenticationForm):
             raise forms.ValidationError(exc)
         if hasattr(self, 'check_for_test_cookie'):  # Dropped in django 1.7
             self.check_for_test_cookie()
+        return self.cleaned_data
+
+
+class Register(forms.Form):
+
+    # We currently only accept registrations from universities
+    # Later on this can be changed by the Organization name
+    university = forms.ChoiceField(choices=univs.UNIV_CHOICES,
+                                   label=_("University"),
+                                   initial='',
+                                   widget=forms.Select(),
+                                   required=True)
+    email = forms.EmailField(label=_("Official E-mail"),
+                             required=True,
+                             initial='Enter university e-mail address')
+    password = forms.CharField(label=_("Password"),
+                               widget=forms.PasswordInput(render_value=False))
+    retype_password = forms.CharField(label=_("Re-type Password"),
+                                      widget=forms.PasswordInput(
+                                          render_value=False))
+
+    @sensitive_variables()
+    def clean(self):
         return self.cleaned_data

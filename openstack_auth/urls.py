@@ -22,6 +22,13 @@ utils.patch_middleware_get_user()
 urlpatterns = [
     url(r"^login/$", views.login, name='login'),
     url(r"^logout/$", views.logout, name='logout'),
+    url(r"^register/$", views.register, name='register'),
+    url(r"^forgot_password/(?P<email>[^/]+)/$", views.forgot_password,
+        name='forgot_password'),
+    url(r"^resend_confirm_mail/(?P<email>[^/]+)/$", views.resend_confirm_mail,
+        name='resend_confirm_mail'),
+    url(r'^confirm_mail/(?P<token>[^/]+)/$', views.confirm_mail,
+        name='confirm_mail'),
     url(r'^switch/(?P<tenant_id>[^/]+)/$', views.switch,
         name='switch_tenants'),
     url(r'^switch_services_region/(?P<region_name>[^/]+)/$',
