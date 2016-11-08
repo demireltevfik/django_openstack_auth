@@ -239,16 +239,16 @@ def register(request):
 
 
 def generate_confirmation_token(secret):
-    serializer = URLSafeTimedSerializer(settings.SECRET_KEY)
-    return serializer.dumps(secret, salt=settings.SECURITY_PASSWORD_SALT)
+    serializer = URLSafeTimedSerializer(settings.TOKEN_SECRET_KEY)
+    return serializer.dumps(secret, salt=settings.TOKEN_SECURITY_PASSWORD_SALT)
 
 
 def confirm_token(token, expiration=3600):
-    serializer = URLSafeTimedSerializer(settings.SECRET_KEY)
+    serializer = URLSafeTimedSerializer(settings.TOKEN_SECRET_KEY)
     try:
         secret = serializer.loads(
             token,
-            salt=settings.SECURITY_PASSWORD_SALT,
+            salt=settings.TOKEN_SECURITY_PASSWORD_SALT,
             max_age=expiration
         )
     except Exception:
